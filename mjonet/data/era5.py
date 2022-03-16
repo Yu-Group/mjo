@@ -1,11 +1,12 @@
 """Load and preprocess raw ERA5 reanalysis data.
 """
 
-import re
 import glob
 import json
+from itertools import chain
 from datetime import datetime, timedelta
 
+import dask
 import numpy as np
 import xarray as xr
 import netCDF4 as nc
@@ -112,6 +113,9 @@ def hdf5_to_npz(save_dir,
     verbose: bool, optional
         If True, print progress.
     """
+
+    parallel = False
+
     save_dir = save_dir[:-1] if save_dir[-1] == '/' else save_dir
 
     var_list = list(var_names)
@@ -120,252 +124,107 @@ def hdf5_to_npz(save_dir,
     if plevels is None:
         plevels = [200, 500, 850]
 
-    filename_dict = get_filenames(*var_list, glob_dict=glob_dict,
-                                  year_or_range=year_or_range, era5_dir=era5_dir)
+    fnames = get_filenames(*var_list, glob_dict=glob_dict,
+                           year_or_range=year_or_range, era5_dir=era5_dir)
 
-    # get the start and end datetimes (inclusive) for the first sequence of samples
-    first_file = filename_dict[var_list[0]][0]
-    samples_start = _daterange_from_filename(first_file)[0]
-    samples_end = samples_start + timedelta(hours=time_step*(samples_per_npz - 1))
+    fnames = list(chain(*fnames.values()))
 
-    open_data = {} # dict for in-use NetCDF4 Datasets
-    var_dim_len = 0 # var dimension, including levels
-    for var in var_list:
+    with dask.config.set(**{'array.slicing.split_large_chunks': False}):
+        dset = xr.open_mfdataset(fnames,
+                                 preprocess=_convert_to_time_idx,
+                                 concat_dim='time',
+                                 data_vars='minimal',
+                                 coords='minimal',
+                                 compat='override',
+                                 engine='h5netcdf',
+                                 parallel=parallel)
 
-        # open the first var file to examine
-        dset = nc.Dataset(filename_dict[var][0], 'r')
+    # dset = _process_dataset(dset, var.toupper(), time_step, plevels))
 
-        # get the idx in the var dimension for this variable
-        if 'level' in dset.variables:
-            var_idx = list(range(var_dim_len, var_dim_len + len(plevels)))
-            var_dim_len += len(plevels)
-        else:
-            var_idx = var_dim_len
-            var_dim_len += 1
+    return dset
 
+
+def _convert_to_time_idx(dset):
+    """This should only be used on datasets that fit in memory.
+    """
+    if 'time' in dset.variables:
+        return dset
+
+    if 'forecast_initial_time' in dset.variables:
+
+        # try to get the main variable name
+        var = _find_primary_var_name(dset)
+
+        # extract time x (lat, lon)
+        data = [
+            (init.data + hour.data.astype('timedelta64[h]'),
+             dset[var].sel(forecast_initial_time = init, forecast_hour = hour))
+            for init in dset['forecast_initial_time']
+            for hour in dset['forecast_hour']
+        ]
+
+        # done with original dataset, close it
         dset.close()
 
-        # create metadata dict for var
-        open_data[var] = {
-            'var': var.upper(),
-            'var_idx': var_idx, # position of var levels in sample array
-            'dset': None,
-            'dset_end': None,
-            'dset_idx': None, # first unused sample for a new batch of data
-            'samples_idx': 0 # next index to process in sequence of grouped samples
-        }
+        # make the time dimension and utc_date var
+        times = [tup[0] for tup in data]
+        times = xr.DataArray(times, coords={'time': times},
+                             dims=('time',), name='time',
+                             attrs={'long_name': 'time'})
 
-    # variables x levels, latitude (height), longitude (width)
-    dset = nc.Dataset(first_file, 'r')
-    sample_shape = (var_dim_len, dset['latitude'].size, dset['longitude'].size)
-    dset.close()
+        # create the new dataset indexed by time
+        dset = xr.Dataset({
+            var: xr.concat([tup[1] for tup in data], dim=times),
+            # 'utc_date': utc_date
+        }).drop(['forecast_initial_time', 'forecast_hour'])
 
-    n_written = 0
-    while samples_start is not None:
+    assert 'time' in dset.variables, \
+        f'Could not create a time index for dataset from file {dset.encoding["source"]}'
 
-        # create a new set of samples that will be saved together
-        samples = {
-            'samples': [np.empty(sample_shape, dtype=np.float32) for _ in range(samples_per_npz)],
-            'samples_n': samples_per_npz,
-            'samples_end': samples_end
-        }
+    return dset
 
-        # loop over the vars
-        for var in var_list:
-
-            # check for already opened data
-            if open_data[var]['dset'] is not None:
-
-                # there's a cached dset with samples we need for the new sequence
-                # happens when time_step * samples_per_npz is shorter than time range of files
-
-                # extract samples
-                _process_open_dataset(open_data[var], samples, time_step, plevels)
-
-            if open_data[var]['samples_idx'] < samples_per_npz:
-
-                # there was no cached data or it didn't have enough samples to
-                # complete the sample sequence, so create a new multi-file
-                # dataset (xr.Dataset)
-
-                dset_end = datetime(1900, 1, 1, 0)
-                dset_files = []
-
-                # check current end time and whether there are any files left
-                while dset_end < samples_end and len(filename_dict[var]) > 0:
-                    # get the next file, update end time, and add to file list
-                    next_file = filename_dict[var].pop(0)
-                    dset_range = _daterange_from_filename(next_file)
-                    dset_end = dset_range[1]
-                    dset_files.append(next_file)
-
-                # if needed, add more files for the final sample's target
-                fname_iter = iter(filename_dict[var])
-                fname = next(fname_iter, None)
-                while dset_end < samples_end and fname is not None:
-                    dset_end = _daterange_from_filename(fname)[1]
-                    dset_files.append(fname)
-                    fname = next(fname_iter, None)
-
-                # update samples_per_npz and samples_end using the actual number we got
-                if dset_end < samples_end:
-                    samples_per_npz = (dset_end - samples_start) // timedelta(hours = time_step)
-                    samples_end = samples_start + timedelta(hours=time_step*samples_per_npz)
-
-                # create a multi-file xr.Dataset
-                open_data[var]['dset'] = xr.open_mfdataset(dset_files)
-                open_data[var]['dset_end'] = dset_end
-
-                # extract samples
-                _process_open_dataset(open_data[var], samples, time_step, plevels)
-
-            # reset index in samples
-            open_data[var]['samples_idx'] = 0
-
-        stage = f'-{stage}' if stage else ''
-        file_prefix = f'{save_dir}/era5{stage}-{str(n_written).zfill(9)}'
-        np.save_z_compressed(f'{file_prefix}.npz', *samples['samples'])
-        metadata = {
-            'var_idx': { var: open_data[var]['var_idx'] for var in var_list },
-            'plevels': plevels,
-            'time_step': time_step,
-            'n_samples': samples_per_npz,
-            'start': str(samples_start),
-            'end': str(samples_end)
-        }
-        with open(f'{file_prefix}.json', 'w', encoding='utf-8') as outfile:
-            json.dump(metadata, outfile, ensure_ascii=False, indent=4)
-        n_written += 1
-        if verbose:
-            print(f'Wrote {file_prefix}' + '.{npz,json}')
-
-        # check if there are more samples to process
-        if np.all([open_data[var]['dset'] is not None or len(filename_dict[var]) > 0
-                   for var in var_list]):
-            samples_start = samples_end + timedelta(hours=time_step)
-            samples_end = samples_start + timedelta(hours=time_step*(samples_per_npz - 1))
-
-        else:
-            # if not, we're finished
-            samples_start = None
-    # clean up
-    for var in var_list:
-        if open_data[var]['dset'] is not None:
-            open_data[var]['dset'].close()
+def _find_primary_var_name(dset):
+    multi_dim_vars = [var.name for var in dset.data_vars.values() if len(var.dims) > 1]
+    assert len(multi_dim_vars) == 1, \
+        f'Don\'t know how to find primary var name for dataset from file {dset.encoding["source"]}'
+    return multi_dim_vars[0]
 
 
-def _daterange_from_filename(filename):
-    """Get the range of dates from an ERA5 filename and return as tuple of datetimes.
+def _process_dataset(dset, time_step, plevels, var=None):
+    """Extract samples points from dset, returning an xr.DataArray.
     """
-    match = re.search(r'\.([0-9]{10})_([0-9]{10})\.nc$', filename)
-    assert match and match.lastindex == 2, f'The filename has unexpected format: {filename}'
-    start, end = match[1], match[2]
-    return (datetime(year=int(start[:4]), month=int(start[4:6]),
-                     day=int(start[6:8]), hour=int(start[8:])),
-            datetime(year=int(end[:4]), month=int(end[4:6]),
-                     day=int(end[6:8]), hour=int(end[8:])))
-
-
-def _process_open_dataset(dataset_dict, samples_dict, time_step, plevels):
-
-    var = dataset_dict['var']
-    var_idx = dataset_dict['var_idx']
-
-    dset = dataset_dict['dset']
-    dset_idx = dataset_dict['dset_idx']
-    dset_end = dataset_dict['dset_end']
-
-    samples = samples_dict['samples']
-    samples_n = samples_dict['samples_n']
-
-    close_dset = dset_end < samples_dict['samples_end'] + timedelta(hours=time_step)
+    if var is None:
+        var = _find_primary_var_name(dset)
 
     if 'level' in dset.variables: # plevels data
 
         pl_idx = np.where(np.in1d(dset['level'][:], plevels))[0]
 
-        # the final index of 'time' to get from the dataset
-        if dset_idx is None:
-            dset_idx = 0
-            stop_idx = dset['time'].size
-        else:
-            stop_idx = min(dset_idx + samples_n*time_step, dset['time'].size)
-
         # time indices for subsetting samples from the dataset
-        time_idx = list(range(dset_idx, stop_idx, time_step))
+        time_idx = np.arange(0, dset['time'].size, time_step)
 
-        for j, t_idx in enumerate(time_idx):
-            # add data to the sample
-            samples[j][var_idx, :, :] = dset[var][t_idx, pl_idx, :, :]
-
-        if len(time_idx) < samples_n:
-            # don't have all the samples yet, so remember where we left off
-            dataset_dict['samples_idx'] = len(time_idx)
-
-        # dataset may have additional unused sample points
-        dataset_dict['dset_idx'] = time_idx[-1] + time_step
-
-        if close_dset:
-            # update index to first sample position in next dataset
-            dataset_dict['dset_idx'] = dataset_dict['dset_idx'] % dset['time'].size
+        darray = dset[var][time_idx, pl_idx, :, :]
 
     elif 'forecast_initial_time' in dset.variables: # aggregated data
 
-        if dset_idx is None:
-            fi_idx = 0 # forecast_initial_time (aka forecast_reference_time)
-            fh_idx = 0 # forecast_hour (aka forecast_period)
-        else:
-            fi_idx = dset_idx[0]
-            fh_idx = dset_idx[1]
-
-        # reference time
-        fi_time = dset['forecast_initial_time'][fi_idx]
+        # first time in dset
+        t_0 = dset['forecast_initial_time'][0].data.astype('datetime64[h]')
 
         # distance between forecast initial times
-        fh_size = dset['forecast_hour'].size
+        fi_delta = dset['forecast_hour'][-1].data.astype('timedelta64[h]')
 
         # the last time in dataset
-        last_time = dset['forecast_initial_time'][-1] + fh_size - 1
+        last_t = dset['forecast_initial_time'][-1].data + fi_delta
 
         # times for unused sample points in the dataset
-        unused_times = [dset['forecast_initial_time'][fi_idx] + fh_idx]
-        next_time = unused_times[-1] + time_step
-
-        # add sample point times until we run out or don't need more
-        while next_time <= last_time and len(unused_times) < samples_n:
-            unused_times.append(next_time)
-            next_time += time_step
+        time_idx = np.arange(t_0, last_t, np.timedelta64(time_step, 'h'), dtype='datetime64[h]')
 
         # indices of forecast initial time for the samples
-        fi_idxs = [fi_idx + (t - fi_time) // fh_size for t in unused_times]
+        fi_idx = ((time_idx - t_0) // fi_delta)# .astype('datetime64[h]')
 
         # indices of forecast hour for the samples
-        fh_idxs = [(t - fi_time) % fh_size for t in unused_times]
+        fh_idx = (time_idx - t_0) % fi_delta
 
-        for j in range(len(unused_times)):
-            # add data to the sample
-            samples[j][var_idx, :, :] = dset[var][fi_idxs[j], fh_idxs[j], :, :]
+        darray = dset[var][fi_idx, fh_idx, :, :]
 
-        if len(unused_times) < samples_n:
-            # don't have all the samples yet, need to remember where we left off
-            dataset_dict['samples_idx'] = len(unused_times)
-
-        # dataset may have additional unused sample points
-        next_time += time_step
-        next_fi_idx = fi_idx + (next_time - fi_time) // fh_size
-        next_fh_idx = (next_time - fi_time) % fh_size
-
-        if close_dset:
-            dataset_dict['dset_idx'] = (
-                next_fi_idx % dset['forecast_initial_time'].size,
-                next_fh_idx
-            )
-        else:
-            dataset_dict['dset_idx'] = (next_fi_idx, next_fh_idx)
-
-    # check if we used up the dataset
-    if close_dset:
-        # done with open dataset, close it
-        dataset_dict['dset'].close()
-        dataset_dict['dset'] = None
-        dataset_dict['dset_end'] = None
+    return darray
