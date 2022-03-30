@@ -18,8 +18,6 @@ setuptools.setup(
     url='https://github.com/Yu-Group/mjonet',
     packages=setuptools.find_packages(exclude=['tests']),
     install_requires=[
-        'torch>=1.6',
-        'numpy',
     ],
     python_requires='>=3.6',
     classifiers=[

@@ -4,13 +4,11 @@
 import glob
 import json
 from itertools import chain
-from datetime import datetime, timedelta
 
 import dask
 import numpy as np
 import xarray as xr
-import netCDF4 as nc
-
+import xesmf as xe
 
 def get_filenames(*var_names: str,
                   glob_dict: dict=None,
@@ -70,8 +68,9 @@ def get_filenames(*var_names: str,
 def hdf5_to_npz(save_dir,
                 *var_names: str,
                 time_step: int=6,
-                samples_per_npz: int=28,
                 plevels: list=None,
+                resolution: float=0.25,
+                samples_per_npz: int=28,
                 glob_dict: dict=None,
                 year_or_range: tuple=None,
                 era5_dir: str='/global/cfs/projectdirs/m3522/cmip6/ERA5',
@@ -93,6 +92,9 @@ def hdf5_to_npz(save_dir,
         The frequency at which to sample points in the time domain. The real-time length depends on
         the resolution of the data, but we assume 1 step = 1 hour for ERA5. Default frequency is
         every 6 time points.
+    resolution: float, optional
+        The vertical / horizontal spacing between grid points, in degrees. The default 0.25 is the
+        original resolution of the ERA5 dataset.
     samples_per_npz: int, optional
         The number of data samples to write to a single output npz file. With time_step 6, the
         default of 28 gives a week of data per npz file.
@@ -131,21 +133,22 @@ def hdf5_to_npz(save_dir,
 
     with dask.config.set(**{'array.slicing.split_large_chunks': False}):
         dset = xr.open_mfdataset(fnames,
-                                 preprocess=_convert_to_time_idx,
-                                 concat_dim='time',
+                                 preprocess=_convert_to_time_index,
+                                 # concat_dim='time',
                                  data_vars='minimal',
                                  coords='minimal',
                                  compat='override',
                                  engine='h5netcdf',
                                  parallel=parallel)
 
-    # dset = _process_dataset(dset, var.toupper(), time_step, plevels))
+    dset.encoding['source'] = 'hdf5_to_npz'
+    dset = _process_dataset(dset, var_list, time_step, plevels, resolution)
 
     return dset
 
 
-def _convert_to_time_idx(dset):
-    """This should only be used on datasets that fit in memory.
+def _convert_to_time_index(dset):
+    """Convert initial time / hour time to a time index.
     """
     if 'time' in dset.variables:
         return dset
@@ -174,57 +177,63 @@ def _convert_to_time_idx(dset):
 
         # create the new dataset indexed by time
         dset = xr.Dataset({
-            var: xr.concat([tup[1] for tup in data], dim=times),
-            # 'utc_date': utc_date
+            var: xr.concat([tup[1] for tup in data], dim=times)
         }).drop(['forecast_initial_time', 'forecast_hour'])
 
     assert 'time' in dset.variables, \
-        f'Could not create a time index for dataset from file {dset.encoding["source"]}'
+        f'Could not create a time index for dataset from {dset.encoding["source"]}'
 
     return dset
 
+
 def _find_primary_var_name(dset):
-    multi_dim_vars = [var.name for var in dset.data_vars.values() if len(var.dims) > 1]
+    # TODO: check if var.name is uppercase
+    multi_dim_vars = [var.name for var in dset.data_vars.values()
+                      if len(var.dims) > 1]
     assert len(multi_dim_vars) == 1, \
-        f'Don\'t know how to find primary var name for dataset from file {dset.encoding["source"]}'
+        f'Don\'t know how to find primary var name for dataset from {dset.encoding["source"]}'
     return multi_dim_vars[0]
 
 
-def _process_dataset(dset, time_step, plevels, var=None):
+def _process_dataset(dset, var_list, time_step, plevels, resolution):
     """Extract samples points from dset, returning an xr.DataArray.
     """
-    if var is None:
-        var = _find_primary_var_name(dset)
 
-    if 'level' in dset.variables: # plevels data
+    indexers = {
+        'time': np.arange(0, dset['time'].size, time_step),
+        'level': [i for i, lev in enumerate(dset['level']) if lev in plevels]
+    }
 
-        pl_idx = np.where(np.in1d(dset['level'][:], plevels))[0]
+    # subsample the data
+    dset = dset.isel(indexers).rename({'latitude': 'lat', 'longitude': 'lon'})
 
-        # time indices for subsetting samples from the dataset
-        time_idx = np.arange(0, dset['time'].size, time_step)
+    # regrid
+    if resolution > 0.25:
+        grid = _grid_era5(dset, resolution)
+        regridder = xe.Regridder(dset, grid, 'conservative', periodic=True)
+        dset = regridder(dset)
 
-        darray = dset[var][time_idx, pl_idx, :, :]
+    return dset
 
-    elif 'forecast_initial_time' in dset.variables: # aggregated data
 
-        # first time in dset
-        t_0 = dset['forecast_initial_time'][0].data.astype('datetime64[h]')
+def _grid_era5(dset, res):
+    """Like xesmf.util.grid_2d, but keeping ERA5 data conventions. See
+    https://github.com/JiaweiZhuang/xESMF/blob/master/xesmf/util.py.
+    """
+    # bounds
+    # latitude ranges from high to low in ERA5
+    lat_b = np.arange(dset['lat'].max(), dset['lat'].min() - res, -res)
+    lon_b = np.arange(dset['lon'].min(), dset['lon'].max() + res, res)
 
-        # distance between forecast initial times
-        fi_delta = dset['forecast_hour'][-1].data.astype('timedelta64[h]')
+    # centers
+    lat = (lat_b[:-1] + lat_b[1:])/2
+    lon = (lon_b[:-1] + lon_b[1:])/2
 
-        # the last time in dataset
-        last_t = dset['forecast_initial_time'][-1].data + fi_delta
+    grid = xr.Dataset(coords={
+        'lon': (['lon'], lon),
+        'lat': (['lat'], lat),
+        'lon_b': (['lon_b'], lon_b),
+        'lat_b': (['lat_b'], lat_b)
+    })
 
-        # times for unused sample points in the dataset
-        time_idx = np.arange(t_0, last_t, np.timedelta64(time_step, 'h'), dtype='datetime64[h]')
-
-        # indices of forecast initial time for the samples
-        fi_idx = ((time_idx - t_0) // fi_delta)# .astype('datetime64[h]')
-
-        # indices of forecast hour for the samples
-        fh_idx = (time_idx - t_0) % fi_delta
-
-        darray = dset[var][fi_idx, fh_idx, :, :]
-
-    return darray
+    return grid
