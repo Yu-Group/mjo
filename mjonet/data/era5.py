@@ -1,8 +1,10 @@
 """Load and preprocess raw ERA5 reanalysis data.
 """
 
+import re
 import glob
 import json
+from datetime import datetime, timedelta
 from itertools import chain
 
 import dask
@@ -18,10 +20,7 @@ def preprocess(*var_names: str,
                glob_dict: dict=None,
                year_or_range: tuple=None,
                era5_dir: str='/global/cfs/projectdirs/m3522/cmip6/ERA5',
-               save_dir: str=None,
-               steps_per_chunk: int=None,
-               stage: str=None,
-               parallel: str=True,
+               parallel: str=False,
                verbose: bool=False):
     """Read in ERA5 data stored in HDF5 format, extract specified variables at specified time
     intervals and pressure levels, regrid to a given resolution, and save a specified number of
@@ -31,11 +30,11 @@ def preprocess(*var_names: str,
     Parameters
     __________
     var_names: List[str]
-        See `var_names` parameter in `get_filenames`.
+        The variable names ("Short Name"), as specified by https://rda.ucar.edu/datasets/ds633.0/.
     time_step: int, optional
         The frequency at which to sample points in the time domain. The real-time length depends on
-        the resolution of the data, but we assume 1 step = 1 hour for ERA5. Default frequency is
-        every 6 time points.
+        the temporal resolution of the data, but we assume 1 step = 1 hour for ERA5. Default
+        frequency is every 6 time points.
     plevels: Union[List[int], Dict[str, List[int]]], optional
         The specific values at which to sample points in the pressure level domain. Units are hPa.
         Either a list of levels, in which case the same levels are used for every variable that has
@@ -50,37 +49,24 @@ def preprocess(*var_names: str,
         See `year_or_range` parameter in `get_filenames`.
     era5_dir: str, optional
         See `era5_dir` parameter in `get_filenames`.
-    save_dir: str, optional
-        If provided, saves outputs in the directory with filenames like f'era5-{stage}-000000.zarr'.
-    steps_per_chunk: int, optional
-        Number of time points to include in each chunk of `xarray.DataArray`s and output files. If
-        `None`, uses the chunk size set by dask.
-    stage: str, optional
-        If provided, should be one of 'train', 'validate', and 'test'.
     parallel: bool, optional
         If True (the default), open and preprocess files in parallel via `dask.delayed`. Passed as
         parameter of the same name to `xarray.open_mfdataset`.
     verbose: bool, optional
         If True, print progress.
     """
-    save_dir = save_dir[:-1] if save_dir[-1] == '/' else save_dir
-
     var_list = list(var_names)
     var_list.sort()
 
     fnames = get_filenames(*var_list, glob_dict=glob_dict,
                            year_or_range=year_or_range, era5_dir=era5_dir)
-    fnames = list(chain(*fnames.values()))
+    flist = list(chain(*fnames.values()))
 
     if verbose:
-        print(f'Processing {len(fnames)} files.')
-
-    chunks = None
-    if steps_per_chunk is not None:
-        chunks = { 'time': steps_per_chunk }
+        print(f'Processing {len(flist)} files...')
 
     with dask.config.set(**{'array.slicing.split_large_chunks': False}):
-        dset = xr.open_mfdataset(fnames,
+        dset = xr.open_mfdataset(flist,
                                  preprocess=_preprocess_one_file,
                                  data_vars='minimal',
                                  coords='minimal',
@@ -88,12 +74,15 @@ def preprocess(*var_names: str,
                                  engine='h5netcdf',
                                  parallel=parallel)
 
-    if verbose:
-        print(f'Datasets opened and combined. Subsampling and regridding.')
+        if verbose:
+            print(f'Datasets opened and combined. Removing missing times...')
 
-    dset.encoding['source'] = 'mjonet.data.era5.process'
+        dset = _remove_missing_times(dset, fnames)
 
-    with dask.config.set(**{'array.slicing.split_large_chunks': False}):
+        if verbose:
+            print(f'Missing times removed. Subsampling and regridding...')
+
+        dset.encoding['source'] = 'mjonet.data.era5.process'
         dset = subsample_and_regrid(dset, time_step, plevels, resolution)
 
     return dset
@@ -204,6 +193,66 @@ def get_filenames(*var_names: str,
         filename_dict[var] = glob.glob(glob_dict[var])
         filename_dict[var].sort()
     return filename_dict
+
+
+def _remove_missing_times(dset, fnames):
+    """Remove times with completely missing data from `dset`, based on filenames used to create the
+    dataset.
+    """
+    var_ranges = {}
+
+    for var, flist in fnames.items():
+
+        var_start, var_end = None, None
+
+        for fname in flist:
+
+            file_start, file_end = _timerange_from_filename(fname)
+
+            # update lower bound
+            if var_start is None or file_start < var_start:
+                var_start = file_start
+
+            # update upper bound
+            if var_end is None or file_end > var_end:
+                var_end = file_end
+
+        # update var_ranges
+        var_ranges[var] = (var_start, var_end)
+
+    # find max lower bound and min upper bound
+    lower = np.amax([var_range[0] for var_range in var_ranges.values()])
+    upper = np.amin([var_range[1] for var_range in var_ranges.values()])
+
+    keep = np.logical_and(dset['time'].data >= lower, dset['time'].data <= upper)
+    indexers = { 'time': dset['time'].data[keep] }
+
+    return dset.sel(indexers)
+
+
+def _timerange_from_filename(fname):
+    """Get the range of dates from an ERA5 filename and return as tuple of datetimes.
+    """
+    match = re.search(r'\.([0-9]{10})_([0-9]{10})\.nc$', fname)
+    assert match and match.lastindex == 2, f'The filename has unexpected format: {fname}'
+
+    start, end = match[1], match[2]
+
+    file_start = np.datetime64(
+        f'{start[:4]}-{start[4:6]}-{start[6:8]}T{start[8:]}'
+    ).astype('datetime64[ns]')
+
+    file_end = np.datetime64(
+        f'{end[:4]}-{end[4:6]}-{end[6:8]}T{end[8:]}'
+    ).astype('datetime64[ns]')
+
+    # check if the file is for a forecast
+    if 'e5.oper.fc' in fname:
+        # forecast file names start with earliest forecast_initial_time and end with latest
+        # valid time (forecast_initial_time + forecast_hour)
+        file_start += np.timedelta64(1, 'h')
+
+    return file_start, file_end
 
 
 def _find_primary_var_names(dset):
