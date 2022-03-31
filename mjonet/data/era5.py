@@ -10,6 +10,147 @@ import numpy as np
 import xarray as xr
 import xesmf as xe
 
+
+def preprocess(*var_names: str,
+               time_step: int=6,
+               plevels: list=None,
+               resolution: float=0.25,
+               glob_dict: dict=None,
+               year_or_range: tuple=None,
+               era5_dir: str='/global/cfs/projectdirs/m3522/cmip6/ERA5',
+               save_dir: str=None,
+               steps_per_chunk: int=None,
+               stage: str=None,
+               parallel: str=True,
+               verbose: bool=False):
+    """Read in ERA5 data stored in HDF5 format, extract specified variables at specified time
+    intervals and pressure levels, regrid to a given resolution, and save a specified number of
+    data samples in a single compressed .zarr file named like f'era5-{stage}-000000.zarr', together
+    with a corresponding JSON metadata file.
+
+    Parameters
+    __________
+    var_names: List[str]
+        See `var_names` parameter in `get_filenames`.
+    time_step: int, optional
+        The frequency at which to sample points in the time domain. The real-time length depends on
+        the resolution of the data, but we assume 1 step = 1 hour for ERA5. Default frequency is
+        every 6 time points.
+    plevels: Union[List[int], Dict[str, List[int]]], optional
+        The specific values at which to sample points in the pressure level domain. Units are hPa.
+        Either a list of levels, in which case the same levels are used for every variable that has
+        levels, or a dictionary where the key is a variable names and the value is lists of levels
+        for that variable. If `None`, all levels are included.
+    resolution: float, optional
+        The vertical / horizontal spacing between grid points, in degrees. The default 0.25 is the
+        original resolution of the ERA5 dataset.
+    glob_dict: Dict[str, str], optional
+        See `glob_dict` parameter in `get_filenames`.
+    year_or_range: Tuple[int], optional
+        See `year_or_range` parameter in `get_filenames`.
+    era5_dir: str, optional
+        See `era5_dir` parameter in `get_filenames`.
+    save_dir: str, optional
+        If provided, saves outputs in the directory with filenames like f'era5-{stage}-000000.zarr'.
+    steps_per_chunk: int, optional
+        Number of time points to include in each chunk of `xarray.DataArray`s and output files. If
+        `None`, uses the chunk size set by dask.
+    stage: str, optional
+        If provided, should be one of 'train', 'validate', and 'test'.
+    parallel: bool, optional
+        If True (the default), open and preprocess files in parallel via `dask.delayed`. Passed as
+        parameter of the same name to `xarray.open_mfdataset`.
+    verbose: bool, optional
+        If True, print progress.
+    """
+    save_dir = save_dir[:-1] if save_dir[-1] == '/' else save_dir
+
+    var_list = list(var_names)
+    var_list.sort()
+
+    fnames = get_filenames(*var_list, glob_dict=glob_dict,
+                           year_or_range=year_or_range, era5_dir=era5_dir)
+    fnames = list(chain(*fnames.values()))
+
+    if verbose:
+        print(f'Processing {len(fnames)} files.')
+
+    chunks = None
+    if steps_per_chunk is not None:
+        chunks = { 'time': steps_per_chunk }
+
+    with dask.config.set(**{'array.slicing.split_large_chunks': False}):
+        dset = xr.open_mfdataset(fnames,
+                                 preprocess=_preprocess_one_file,
+                                 data_vars='minimal',
+                                 coords='minimal',
+                                 compat='override',
+                                 engine='h5netcdf',
+                                 parallel=parallel)
+
+    if verbose:
+        print(f'Datasets opened and combined. Subsampling and regridding.')
+
+    dset.encoding['source'] = 'mjonet.data.era5.process'
+
+    with dask.config.set(**{'array.slicing.split_large_chunks': False}):
+        dset = subsample_and_regrid(dset, time_step, plevels, resolution)
+
+    return dset
+
+
+def subsample_and_regrid(dset,
+                         time_step=6,
+                         plevels=None,
+                         resolution=0.25,
+                         rename_lat_lon=True):
+    """Extract samples points from `dset` and regrid the data.
+
+    Parameters
+    __________
+    dset: xarray.Dataset
+        The dataset to subsample and regrid.
+    time_step: int, optional
+        See `time_step` parameter in `preprocess`.
+    plevels: Union[List[int], Dict[str, List[int]]], optional
+        See `plevels` parameter in `preprocess`.
+    resolution: float, optional
+        See `resolution` parameter in `preprocess`.
+    rename_lat_lon: bool, optional
+        If True (the default), rename 'latitude' to 'lat' and 'longitude' to 'lon'.
+    """        
+    # subsample time points
+    dset = dset.isel({'time': np.arange(0, dset['time'].size, time_step)})
+
+    # subsample pressure levels
+    indexers = {}
+
+    if isinstance(plevels, list):
+        var_names = _find_primary_var_names(dset)
+        for var in var_names:
+            indexers[f'{var.lower()}_level'] = levels
+    elif isinstance(plevels, dict):
+        for var, levels in plevels.items():
+            indexers[f'{var.lower()}_level'] = levels
+    else:
+        raise ValueError('plevels should be a list or a dict')
+
+    dset = dset.sel(indexers)
+
+    if rename_lat_lon:
+        assert 'latitude' in dset.variables and 'longitude' in dset.variables, \
+            'Can\'t rename "latitude" and "longitude" variables because one or both are missing'
+        dset = dset.rename({'latitude': 'lat', 'longitude': 'lon'})
+
+    # regrid
+    if resolution > 0.25:
+        grid = _grid_era5(dset, resolution)
+        regridder = xe.Regridder(dset, grid, 'conservative', periodic=True)
+        dset = regridder(dset)
+
+    return dset
+
+
 def get_filenames(*var_names: str,
                   glob_dict: dict=None,
                   year_or_range: tuple=None,
@@ -65,98 +206,26 @@ def get_filenames(*var_names: str,
     return filename_dict
 
 
-def hdf5_to_npz(save_dir,
-                *var_names: str,
-                time_step: int=6,
-                plevels: list=None,
-                resolution: float=0.25,
-                samples_per_npz: int=28,
-                glob_dict: dict=None,
-                year_or_range: tuple=None,
-                era5_dir: str='/global/cfs/projectdirs/m3522/cmip6/ERA5',
-                stage: str=None,
-                verbose: bool=False):
+def _find_primary_var_names(dset):
+    multi_dim_vars = [var.name for var in dset.data_vars.values() if len(var.dims) > 1]
+    assert len(multi_dim_vars) == 1, \
+        f'Don\'t know how to find primary var name for dataset from {dset.encoding["source"]}'
+    if len(multi_dim_vars) == 1:
+        return multi_dim_vars[0]
+    return multi_dim_vars
 
-    """Read in ERA5 data stored in HDF5 format, extract specified variables at specified time
-    intervals and pressure levels, stack variables into a single np.array for each time point,
-    and save a specified number of data samples in a single compressed .npz file named like
-    f'era5-{stage}-000000.npz', together with a corresponding JSON metadata file.
 
-    Parameters
-    __________
-    save_dir: str
-        The directory in which to save outputs. A the .npz files.
-    var_names: List[str]
-        See `var_names` parameter in `get_filenames`.
-    time_step: int, optional
-        The frequency at which to sample points in the time domain. The real-time length depends on
-        the resolution of the data, but we assume 1 step = 1 hour for ERA5. Default frequency is
-        every 6 time points.
-    resolution: float, optional
-        The vertical / horizontal spacing between grid points, in degrees. The default 0.25 is the
-        original resolution of the ERA5 dataset.
-    samples_per_npz: int, optional
-        The number of data samples to write to a single output npz file. With time_step 6, the
-        default of 28 gives a week of data per npz file.
-    plevels: List[int]
-        The specific values at which to sample points in the pressure level domain. Units are hPa.
-        This is only used for a given `netCDF4.Dataset` if it has a variable called 'level'.
-    glob_dict: Dict[str, str], optional
-        See `glob_dict` parameter in `get_filenames`.
-    year_or_range: Tuple[int], optional
-        See `year_or_range` parameter in `get_filenames`.
-    overwrite: bool, optional
-        If True, overwrite any existing files in `save_dir`. Default is False, in which case
-        existing files trigger a warning and nothing is written.
-    era5_dir: str
-        See `era5_dir` parameter in `get_filenames`.
-    stage: str, optional
-        If provided, should be one of 'train', 'validate', and 'test'.
-    verbose: bool, optional
-        If True, print progress.
+def _preprocess_one_file(dset):
+    """Preprocess a dataset from a single ERA5 file by renaming 'level' and creating 'time' from
+    'forecast_initial_time' and 'forecast_hour'.
     """
+    # try to get the main variable name
+    var = _find_primary_var_names(dset)
 
-    parallel = False
-
-    save_dir = save_dir[:-1] if save_dir[-1] == '/' else save_dir
-
-    var_list = list(var_names)
-    var_list.sort()
-
-    if plevels is None:
-        plevels = [200, 500, 850]
-
-    fnames = get_filenames(*var_list, glob_dict=glob_dict,
-                           year_or_range=year_or_range, era5_dir=era5_dir)
-
-    fnames = list(chain(*fnames.values()))
-
-    with dask.config.set(**{'array.slicing.split_large_chunks': False}):
-        dset = xr.open_mfdataset(fnames,
-                                 preprocess=_convert_to_time_index,
-                                 # concat_dim='time',
-                                 data_vars='minimal',
-                                 coords='minimal',
-                                 compat='override',
-                                 engine='h5netcdf',
-                                 parallel=parallel)
-
-    dset.encoding['source'] = 'hdf5_to_npz'
-    dset = _process_dataset(dset, var_list, time_step, plevels, resolution)
-
-    return dset
-
-
-def _convert_to_time_index(dset):
-    """Convert initial time / hour time to a time index.
-    """
-    if 'time' in dset.variables:
-        return dset
+    if 'level' in dset.variables:
+        dset = dset.rename({'level': f'{var.lower()}_level'})
 
     if 'forecast_initial_time' in dset.variables:
-
-        # try to get the main variable name
-        var = _find_primary_var_name(dset)
 
         # extract time x (lat, lon)
         data = [
@@ -182,36 +251,6 @@ def _convert_to_time_index(dset):
 
     assert 'time' in dset.variables, \
         f'Could not create a time index for dataset from {dset.encoding["source"]}'
-
-    return dset
-
-
-def _find_primary_var_name(dset):
-    # TODO: check if var.name is uppercase
-    multi_dim_vars = [var.name for var in dset.data_vars.values()
-                      if len(var.dims) > 1]
-    assert len(multi_dim_vars) == 1, \
-        f'Don\'t know how to find primary var name for dataset from {dset.encoding["source"]}'
-    return multi_dim_vars[0]
-
-
-def _process_dataset(dset, var_list, time_step, plevels, resolution):
-    """Extract samples points from dset, returning an xr.DataArray.
-    """
-
-    indexers = {
-        'time': np.arange(0, dset['time'].size, time_step),
-        'level': [i for i, lev in enumerate(dset['level']) if lev in plevels]
-    }
-
-    # subsample the data
-    dset = dset.isel(indexers).rename({'latitude': 'lat', 'longitude': 'lon'})
-
-    # regrid
-    if resolution > 0.25:
-        grid = _grid_era5(dset, resolution)
-        regridder = xe.Regridder(dset, grid, 'conservative', periodic=True)
-        dset = regridder(dset)
 
     return dset
 
