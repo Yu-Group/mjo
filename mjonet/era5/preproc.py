@@ -14,6 +14,13 @@ import dask
 import numpy as np
 import xesmf as xe
 import xarray as xr
+import webdataset as wds
+
+
+__all__ = ['create_wds', 
+           'get_filenames', 
+           'preprocess', 
+           'subsample_and_regrid']
 
 
 def preprocess(*var_names: str,
@@ -115,20 +122,29 @@ def subsample_and_regrid(dset,
     if time_step is not None:
         dset = dset.isel({'time': np.arange(0, dset['time'].size, time_step)})
 
-    # subsample pressure levels
-    indexers = {}
+    # create new variables by subsampling pressure levels
+    
+    if plevels is None and 'level' in dset:
+        plevels = list(dset['level'].data)
 
     if isinstance(plevels, list):
+        levels = plevels
+        plevels = {}
         var_names = _find_primary_var_names(dset)
         for var in var_names:
-            indexers[f'{var.lower()}_level'] = levels
-    elif isinstance(plevels, dict):
+            if 'level' in dset[var].dims:
+                plevels[var] = levels
+
+    if isinstance(plevels, dict):
         for var, levels in plevels.items():
-            indexers[f'{var.lower()}_level'] = levels
+            var = var.upper()
+            for level in levels:
+                # create a new variable from the var's data at level
+                dset = dset.assign({f'{var}_{level}': dset[var].sel({'level': level})})
+            dset = dset.drop_vars(var)
+    
     elif plevels is not None:
         raise ValueError('plevels should be a list or a dict')
-
-    dset = dset.sel(indexers)
 
     if rename_lat_lon:
         assert 'latitude' in dset.variables and 'longitude' in dset.variables, \
@@ -275,9 +291,6 @@ def _preprocess_one_file(dset):
     # try to get the main variable name
     var = _find_primary_var_names(dset)
 
-    if 'level' in dset.variables:
-        dset = dset.rename({'level': f'{var.lower()}_level'})
-
     if 'forecast_initial_time' in dset.variables:
 
         # extract time x (lat, lon)
@@ -302,6 +315,9 @@ def _preprocess_one_file(dset):
     assert 'time' in dset.variables, \
         f'Could not create a time index for dataset from {dset.encoding["source"]}'
 
+    if 'utc_date' in dset:
+        dset = dset.drop_vars('utc_date')
+    
     return dset
 
 

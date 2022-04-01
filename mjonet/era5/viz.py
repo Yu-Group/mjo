@@ -4,7 +4,11 @@ from cartopy import crs as ccrs
 
 import numpy as np
 
-def plot_era5(*darrays, extent=None):
+
+__all__ = ['plot']
+
+
+def plot(*darrays, extent=None):
     if extent is None:
         extent = [-75, 85, -15, 75]
 
