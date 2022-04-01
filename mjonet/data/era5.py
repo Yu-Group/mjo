@@ -1,16 +1,19 @@
 """Load and preprocess raw ERA5 reanalysis data.
 """
 
+import io
+import os
 import re
 import glob
 import json
+
 from datetime import datetime, timedelta
 from itertools import chain
 
 import dask
 import numpy as np
-import xarray as xr
 import xesmf as xe
+import xarray as xr
 
 
 def preprocess(*var_names: str,
@@ -89,7 +92,7 @@ def preprocess(*var_names: str,
 
 
 def subsample_and_regrid(dset,
-                         time_step=6,
+                         time_step=None,
                          plevels=None,
                          resolution=0.25,
                          rename_lat_lon=True):
@@ -107,9 +110,10 @@ def subsample_and_regrid(dset,
         See `resolution` parameter in `preprocess`.
     rename_lat_lon: bool, optional
         If True (the default), rename 'latitude' to 'lat' and 'longitude' to 'lon'.
-    """        
+    """
     # subsample time points
-    dset = dset.isel({'time': np.arange(0, dset['time'].size, time_step)})
+    if time_step is not None:
+        dset = dset.isel({'time': np.arange(0, dset['time'].size, time_step)})
 
     # subsample pressure levels
     indexers = {}
@@ -121,7 +125,7 @@ def subsample_and_regrid(dset,
     elif isinstance(plevels, dict):
         for var, levels in plevels.items():
             indexers[f'{var.lower()}_level'] = levels
-    else:
+    elif plevels is not None:
         raise ValueError('plevels should be a list or a dict')
 
     dset = dset.sel(indexers)
@@ -283,9 +287,6 @@ def _preprocess_one_file(dset):
             for init in dset['forecast_initial_time']
             for hour in dset['forecast_hour']
         ]
-
-        # done with original dataset, close it
-        dset.close()
 
         # make the time dimension and utc_date var
         times = [tup[0] for tup in data]
