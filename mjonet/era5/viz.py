@@ -3,43 +3,109 @@ from matplotlib import colors
 from cartopy import crs as ccrs
 
 import numpy as np
+import xarray as xr
+
+__all__ = ['plot_2d']
 
 
-__all__ = ['plot']
+def plot_2d(*darrays,
+            time=0,
+            plevels=None,
+            figsize: tuple=None,
+            extents: list=None,
+            subplot_kws=None,
+            cbar_kwargs=None,
+            **kwargs):
+    """Plot xarray.DataArrays that were loaded directly from CIMP ERA5 or processed via `mjonet.era5.preprocess`.
 
+    Parameters
+    __________
+    darrays: List[xarray.DataArray]
+        DataArrays to plot. Should include the entire global grid.
+    time: Union[int, str, numpy.datetime64[ns]], optional
+        Common time point in each of the `darrays` to plot. Default is the first time point of each array.
+    plevels: Union[int, dict], optional
+        Pressure levels to plot for each of the `darrays`.
+    figsize: Tuple[float, float], optional
+        Passed to `matplotlib.pyplot.subplots`.
+    extents: List[int], optional
+        Longitude and latitude bounds in format [lon_lower, lon_upper, lat_lower, lat_upper]
+    subplot_kws: dict, optional
+        Passed to `matplotlib.pyplot.subplots`. Default is `{'projection': ccrs.PlateCarree(central_longitude=180)}`.
+    cbar_kwargs: dict, optional
+        Passed to `xarray.DataArray.plot`. Default is `{'shrink': 0.6}`.
+    **kwargs, optional
+        Additional keyword args passed to `xarray.DataArray.plot`.
+    """
 
-def plot(*darrays, extent=None):
-    if extent is None:
-        extent = [-75, 85, -15, 75]
-
-    lat = darrays[0]['lat'][:]
-    lon = darrays[0]['lon'][:]
-    ratio = lon.size / lat.size
-
-    # extract longitude extent (recall that lon ranges from 0 to 360 in the ERA5 data)
-    x_idx = np.intersect1d(np.where(lon >= extent[0] + 180), np.where(lon <= extent[1] + 180))
-    x = lon[x_idx]
-
-    # extract latitude extent
-    y_idx = np.intersect1d(np.where(lat >= extent[2]), np.where(lat <= extent[3]))
-    y = lat[y_idx]
+    if isinstance(plevels, dict):
+        plevels = { k.lower(): v for k, v in plevels.items() }
 
     R, C = len(darrays) // 2 + len(darrays) % 2, min(len(darrays), 2)
-    figsize = (8*C, 5*R)
-    proj = ccrs.PlateCarree(central_longitude=-180.0)
-    fig, axs = plt.subplots(nrows=R, ncols=C, 
-                            sharex=True, sharey=True, 
-                            subplot_kw={'projection': proj}, 
-                            figsize=figsize)#,squeeze=False)
+
+    if figsize is None:
+        figsize = (8*C, 5*R)
+    if subplot_kws is None:
+        subplot_kws = { 'projection': ccrs.PlateCarree(central_longitude=180) }
+    if cbar_kwargs is None:
+        cbar_kwargs = { 'shrink': 0.6 }
+    if isinstance(time, str):
+        time =  np.datetime64(time).astype('datetime64[ns]')
+
+    # ensures the plot has standard global coords
+    proj = ccrs.PlateCarree()
+    kws = {}
+    if subplot_kws['projection'].proj4_params['lon_0']  != 0:
+        kws = { 'transform': proj }#, 'transform_first': True }
+    kws.update(kwargs)
+
+    fig, axs = plt.subplots(nrows=R, ncols=C,
+                            sharex=True, sharey=True,
+                            subplot_kw=subplot_kws,
+                            figsize=figsize)#, squeeze=False)
 
     for i, darray in enumerate(darrays):
-        # import pdb; pdb.set_trace()
+
+        var_name = darray.name.lower()
+
+        if 'level' in darray.dims and (plevels is None or var_name not in plevels):
+            darray = darray.isel(level=0)
+        elif 'level' in darray.dims:
+            plevel = plevels[var_name]
+            assert isinstance(plevel, int), 'plevels dict must have int values'
+            darray = darray.sel(level=plevel)
+
+        if 'forecast_initial_time' in darray.dims:
+            step = darray['forecast_hour'].size
+
+            if isinstance(time, int):
+                td = time
+            elif isinstance(time, np.datetime64):
+                td = time - darray['forecast_initial_time'][0].data
+                td = td.astype('timedelta64[h]').astype(int) - 1
+
+            fit = darray['forecast_initial_time'][td // step].data
+            fh = darray['forecast_hour'][td % step].data
+
+            darray = darray.sel(forecast_initial_time=fit, forecast_hour=fh)
+            darray = darray.assign_coords(time=fit + fh.astype('timedelta64[h]'))
+            darray = darray.reset_coords(['forecast_initial_time', 'forecast_hour'], drop=True)
+        else:
+            if isinstance(time, int):
+                darray = darray.isel(time=time)
+            elif isinstance(time, np.datetime64):
+                darray = darray.sel(time=time)
+
+        assert len(darray.dims) == 2, f'{var_name} has unexpected dims after slicing: {darray.dims}'
+
         ax = plt.subplot(R, C, i + 1)
-        ax.set_extent(extent, crs=proj)
+
+        if extents is not None:
+            ax.set_extent(extents, crs=proj)
+        else:
+            ax.set_global()
         ax.coastlines()
         ax.gridlines(draw_labels=True, crs=proj)
-        ax.title.set_text(darray.short_name)
-        filled_c = ax.contourf(x, y, darray[y_idx, :][:, x_idx], transform=ccrs.PlateCarree())
-        plt.colorbar(filled_c, orientation='vertical', ax=ax, fraction=ratio*0.046, pad=0.04)
+        darray.plot(subplot_kws=subplot_kws, cbar_kwargs=cbar_kwargs, **kws)
 
     plt.show()

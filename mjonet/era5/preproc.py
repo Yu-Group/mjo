@@ -1,8 +1,6 @@
 """Load and preprocess raw ERA5 reanalysis data.
 """
 
-import io
-import gc
 import os
 import re
 import glob
@@ -16,9 +14,11 @@ import xesmf as xe
 import xarray as xr
 
 
-__all__ = ['get_filenames', 
-           'preprocess', 
-           'subsample_and_regrid']
+__all__ = ['get_filenames',
+           'preprocess',
+           'preprocess_univariate_dset',
+           'subsample_and_regrid',
+           'grid_era5']
 
 
 def preprocess(*var_names: str,
@@ -28,6 +28,7 @@ def preprocess(*var_names: str,
                glob_dict: dict=None,
                year_or_range: tuple=None,
                era5_dir: str='/global/cfs/projectdirs/m3522/cmip6/ERA5',
+               regridder_weights_dir: str=None,
                chunks=None,
                parallel: str=False,
                verbose: bool=False):
@@ -56,6 +57,10 @@ def preprocess(*var_names: str,
         See `year_or_range` parameter in `get_filenames`.
     era5_dir: str, optional
         See `era5_dir` parameter in `get_filenames`.
+    regridder_weights_dir: str, optional
+        If provided, used to look for existing or save new regridding weights.
+    chunks: dict, optional
+        A mapping from dimension names to chunk sizes.
     parallel: bool, optional
         If True (the default), open and preprocess files in parallel via `dask.delayed`. Passed as
         parameter of the same name to `xarray.open_mfdataset`.
@@ -71,15 +76,14 @@ def preprocess(*var_names: str,
 
     if verbose:
         print(f'Processing {len(flist)} files...')
-        
+
     with dask.config.set({'array.slicing.split_large_chunks': False}, config=dask.config.config):
         dset = xr.open_mfdataset(flist,
-                                 preprocess=_preprocess_one_file,
+                                 preprocess=preprocess_univariate_dset,
                                  data_vars='minimal',
                                  coords='minimal',
                                  compat='override',
                                  engine='h5netcdf',
-                                 chunks=chunks,
                                  parallel=parallel)
 
         if verbose:
@@ -91,10 +95,51 @@ def preprocess(*var_names: str,
             print(f'Missing times removed. Subsampling and regridding...')
 
         dset.encoding['source'] = 'mjonet.data.era5.process'
-        dset = subsample_and_regrid(dset, time_step, plevels, resolution).chunk(chunks)
+        dset = subsample_and_regrid(dset,
+                                    time_step,
+                                    plevels,
+                                    resolution,
+                                    weights_dir=regridder_weights_dir)
 
         if chunks is not None:
             dset = dset.chunk(chunks)
+
+    return dset
+
+
+def preprocess_univariate_dset(dset):
+    """Preprocess a dataset with a single ERA5 variable by creating 'time' from
+    'forecast_initial_time' and 'forecast_hour', if necessary.
+    """
+    # try to get the main variable name
+    var = _find_primary_var_names(dset)
+
+    if 'forecast_initial_time' in dset.variables:
+
+        # extract time x (lat, lon)
+        data = [
+            (init.data + hour.data.astype('timedelta64[h]'),
+             dset[var].sel(forecast_initial_time = init, forecast_hour = hour))
+            for init in dset['forecast_initial_time']
+            for hour in dset['forecast_hour']
+        ]
+
+        # make the time dimension and utc_date var
+        times = [tup[0] for tup in data]
+        times = xr.DataArray(times, coords={'time': times},
+                             dims=('time',), name='time',
+                             attrs={'long_name': 'time'})
+
+        # create the new dataset indexed by time
+        dset = xr.Dataset({
+            var: xr.concat([tup[1] for tup in data], dim=times)
+        }).drop(['forecast_initial_time', 'forecast_hour'])
+
+    assert 'time' in dset.variables, \
+        f'Could not create a time index for dataset from {dset.encoding["source"]}'
+
+    if 'utc_date' in dset:
+        dset = dset.drop_vars('utc_date')
 
     return dset
 
@@ -103,7 +148,9 @@ def subsample_and_regrid(dset,
                          time_step=None,
                          plevels=None,
                          resolution=0.25,
-                         rename_lat_lon=True):
+                         rename_lat_lon=True,
+                         weights_dir=None,
+                         clean_weights=False):
     """Extract samples points from `dset` and regrid the data.
 
     Parameters
@@ -118,13 +165,19 @@ def subsample_and_regrid(dset,
         See `resolution` parameter in `preprocess`.
     rename_lat_lon: bool, optional
         If True (the default), rename 'latitude' to 'lat' and 'longitude' to 'lon'.
+    weights_dir: str, optional
+        A directory to look in for existing regridder weights or in which to save the weights if
+        none found.
+    clean_weights
+        If True, clean out the regridder weights file.
+
     """
     # subsample time points
     if time_step is not None:
         dset = dset.isel({'time': np.arange(0, dset['time'].size, time_step)})
 
     # create new variables by subsampling pressure levels
-    
+
     if plevels is None and 'level' in dset:
         plevels = list(dset['level'].data)
 
@@ -143,22 +196,39 @@ def subsample_and_regrid(dset,
                 # create a new variable from the var's data at level
                 dset = dset.assign({f'{var}_{level}': dset[var].sel({'level': level})})
             dset = dset.drop_vars(var)
-    
+
     elif plevels is not None:
         raise ValueError('plevels should be a list or a dict')
 
     if 'level' in dset.dims:
         dset = dset.drop_dims('level')
-    
+
     if rename_lat_lon:
         assert 'latitude' in dset.variables and 'longitude' in dset.variables, \
             'Can\'t rename "latitude" and "longitude" variables because one or both are missing'
         dset = dset.rename({'latitude': 'lat', 'longitude': 'lon'})
 
+    # dset = dset.reindex(lat=dset.lat[::-1])
+
     # regrid
     if resolution > 0.25:
-        grid = _grid_era5(dset, resolution)
-        regridder = xe.Regridder(dset, grid, 'conservative', periodic=True)
+        grid = grid_era5(dset, resolution)
+
+        # reuse weights if possible
+        if weights_dir is not None:
+            fname = f'era5_1.0res_regrid_to_{resolution}res_conservative.nc'
+            fpath = os.path.join(weights_dir, fname)
+            weights_exist = os.path.exists(fpath)
+            regridder = xe.Regridder(dset,
+                                     grid,
+                                     'conservative',
+                                     reuse_weights=weights_exist,
+                                     filename=fpath)
+            if weights_exist and clean_weights:
+                regridder.clean_weight_file()
+        else:
+            regridder = xe.Regridder(dset, grid, 'conservative')
+
         dset = regridder(dset)
 
     return dset
@@ -168,7 +238,6 @@ def get_filenames(*var_names: str,
                   glob_dict: dict=None,
                   year_or_range: tuple=None,
                   era5_dir: str='/global/cfs/projectdirs/m3522/cmip6/ERA5'):
-
     """Get filenames for each input variable. Default settings make many assumptions about the
     directory/filename structure.
 
@@ -288,51 +357,14 @@ def _find_primary_var_names(dset):
     return multi_dim_vars
 
 
-def _preprocess_one_file(dset):
-    """Preprocess a dataset from a single ERA5 file by renaming 'level' and creating 'time' from
-    'forecast_initial_time' and 'forecast_hour'.
-    """
-    # try to get the main variable name
-    var = _find_primary_var_names(dset)
-
-    if 'forecast_initial_time' in dset.variables:
-
-        # extract time x (lat, lon)
-        data = [
-            (init.data + hour.data.astype('timedelta64[h]'),
-             dset[var].sel(forecast_initial_time = init, forecast_hour = hour))
-            for init in dset['forecast_initial_time']
-            for hour in dset['forecast_hour']
-        ]
-
-        # make the time dimension and utc_date var
-        times = [tup[0] for tup in data]
-        times = xr.DataArray(times, coords={'time': times},
-                             dims=('time',), name='time',
-                             attrs={'long_name': 'time'})
-
-        # create the new dataset indexed by time
-        dset = xr.Dataset({
-            var: xr.concat([tup[1] for tup in data], dim=times)
-        }).drop(['forecast_initial_time', 'forecast_hour'])
-
-    assert 'time' in dset.variables, \
-        f'Could not create a time index for dataset from {dset.encoding["source"]}'
-
-    if 'utc_date' in dset:
-        dset = dset.drop_vars('utc_date')
-    
-    return dset
-
-
-def _grid_era5(dset, res):
-    """Like xesmf.util.grid_2d, but keeping ERA5 data conventions. See
+def grid_era5(dset, resolution):
+    """Like xesmf.util.grid_2d, but creates a dataset that matches the CMIP ERA5 grid. See
     https://github.com/JiaweiZhuang/xESMF/blob/master/xesmf/util.py.
     """
     # bounds
     # latitude ranges from high to low in ERA5
-    lat_b = np.arange(dset['lat'].max(), dset['lat'].min() - res, -res)
-    lon_b = np.arange(dset['lon'].min(), dset['lon'].max() + res, res)
+    lat_b = np.arange(dset['lat'].max(), dset['lat'].min() - resolution, -resolution)
+    lon_b = np.arange(dset['lon'].min(), dset['lon'].max() + resolution, resolution)
 
     # centers
     lat = (lat_b[:-1] + lat_b[1:])/2
