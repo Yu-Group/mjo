@@ -5,7 +5,6 @@ import os
 import glob
 
 import numpy as np
-import xesmf as xe
 import xarray as xr
 
 
@@ -166,6 +165,8 @@ def make_regridder(obj,
         If True, clean out the regridder weights file.
 
     """
+    import xesmf as xe
+
     # regrid
     grid = grid_2d(obj, resolution)
 
