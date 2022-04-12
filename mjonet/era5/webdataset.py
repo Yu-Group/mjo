@@ -7,7 +7,6 @@ import time
 import pickle
 import pathlib
 
-import xesmf as xe
 import numpy as np
 import xarray as xr
 import webdataset as wds
@@ -117,10 +116,7 @@ def create_wds(fpaths,
 
     if stage is not None:
         save_dir = os.path.join(save_dir, stage)
-        pathlib.Path(save_dir).mkdir(exist_ok=overwrite)
-
-    if verbose:
-        print(f'Saving WebDataset in {save_dir}...\n')
+        pathlib.Path(save_dir).mkdir(exist_ok=True)
 
     # convert target_steps to sorted indices along dset 'time' axis
     target_steps = np.array(target_steps)
@@ -163,6 +159,9 @@ def create_wds(fpaths,
         # loop over indices of first sample for each tar file
         start_indices = range(0, len(times) - target_steps[-1], samples_per_tar)
 
+        if verbose:
+            print(f'Saving {len(start_indices)} tar files to {save_dir}...\n')
+
         for tar_idx, start_idx in enumerate(start_indices):
 
             if stage is None:
@@ -170,6 +169,11 @@ def create_wds(fpaths,
             else:
                 tar_fname = f'era5-{stage}-{tar_idx:06d}.tar'
             tar_path = os.path.join(save_dir, tar_fname)
+
+            if not overwrite and os.path.exists(tar_path):
+                if verbose:
+                    print(f'File {tar_fname} already exists. Skipping to next file.')
+                continue
 
             if verbose:
                 print(f'\rCreating tar file {tar_fname}...', end='')

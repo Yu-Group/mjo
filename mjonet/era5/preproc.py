@@ -76,6 +76,7 @@ def preprocess(paths,
                                  coords='minimal',
                                  compat='override',
                                  engine='h5netcdf',
+                                 chunks=chunks,
                                  parallel=parallel)
 
         if verbose:
