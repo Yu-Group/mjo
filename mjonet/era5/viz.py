@@ -1,6 +1,5 @@
 from matplotlib import pyplot as plt
 from matplotlib import colors
-from cartopy import crs as ccrs
 
 import numpy as np
 import xarray as xr
@@ -37,6 +36,8 @@ def plot_2d(*darrays,
     **kwargs, optional
         Additional keyword args passed to `xarray.DataArray.plot`.
     """
+
+    from cartopy import crs as ccrs
 
     if isinstance(plevels, dict):
         plevels = { k.lower(): v for k, v in plevels.items() }
